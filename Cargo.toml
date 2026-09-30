@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 cpal = "0.18.2"
+eframe = "0.35.0"
 ringbuf = "0.5.2"
 
 # Release profile tuned for Wasm bundle size.
@@ -13,3 +14,6 @@ opt-level     = "s"    # optimise for size over speed
 lto           = true   # link-time optimisation removes dead code across crates
 panic         = "abort" # eliminates panic-unwind machinery (~10% size saving)
 codegen-units = 1      # single codegen unit enables maximum inlining
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = { version = "0.10.1", features = ["v0_3_49"] }
