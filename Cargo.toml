@@ -1,0 +1,15 @@
+[package]
+name = "rust-audio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cpal = "0.18.2"
+ringbuf = "0.5.2"
+
+# Release profile tuned for Wasm bundle size.
+[profile.release]
+opt-level     = "s"    # optimise for size over speed
+lto           = true   # link-time optimisation removes dead code across crates
+panic         = "abort" # eliminates panic-unwind machinery (~10% size saving)
+codegen-units = 1      # single codegen unit enables maximum inlining
