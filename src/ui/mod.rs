@@ -1,3 +1,5 @@
+mod chain;
+mod sounds;
 mod theme;
 mod widgets;
 
@@ -7,28 +9,33 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use egui::{Align, CornerRadius, Layout, RichText, Stroke};
+use egui::{Align, Layout, RichText};
 
-use crate::audio::Engine;
-use crate::dsp::PipelineRemote;
-use crate::telemetry::{Level, LogEntry};
+use crate::audio::{Engine, Remotes};
+use crate::telemetry::{Level, LogEntry, Logger};
+use sounds::Sounds;
 use widgets::Meter;
 
 const APP_NAME: &str = "Rust Phone";
 const MAX_LOG_ENTRIES: usize = 500;
 // Meters need a steady refresh even when nobody touches the window.
 const REPAINT_EVERY: Duration = Duration::from_millis(33);
+// Below this width, effects and sounds are stacked instead of side by side.
+const TWO_COLUMNS_MIN_WIDTH: f32 = 760.0;
+// Used to decode sounds when audio isn't running, so they're still listed.
+const FALLBACK_SAMPLE_RATE: u32 = 48_000;
 
 pub fn run(
-    engine: Result<(Engine, PipelineRemote), String>,
+    engine: Result<(Engine, Remotes), String>,
     logs: mpsc::Receiver<LogEntry>,
+    logger: Logger,
     started: Instant,
 ) -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
-            .with_inner_size([980.0, 680.0])
-            .with_min_inner_size([720.0, 480.0]),
+            .with_inner_size([1200.0, 760.0])
+            .with_min_inner_size([760.0, 520.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -36,21 +43,19 @@ pub fn run(
         options,
         Box::new(move |cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(engine, logs, started)))
+            Ok(Box::new(App::new(engine, logs, logger, started)))
         }),
     )
 }
 
 struct Running {
     engine: Engine,
-    remote: PipelineRemote,
+    remotes: Remotes,
 }
-
-/// Index of the effect being dragged in the chain.
-struct DraggedEffect(usize);
 
 struct App {
     running: Result<Running, String>,
+    sounds: Sounds,
     logs: mpsc::Receiver<LogEntry>,
     entries: VecDeque<LogEntry>,
     started: Instant,
@@ -63,12 +68,18 @@ struct App {
 
 impl App {
     fn new(
-        engine: Result<(Engine, PipelineRemote), String>,
+        engine: Result<(Engine, Remotes), String>,
         logs: mpsc::Receiver<LogEntry>,
+        logger: Logger,
         started: Instant,
     ) -> Self {
+        let sample_rate = engine
+            .as_ref()
+            .map(|(engine, _)| engine.info().sample_rate)
+            .unwrap_or(FALLBACK_SAMPLE_RATE);
         Self {
-            running: engine.map(|(engine, remote)| Running { engine, remote }),
+            running: engine.map(|(engine, remotes)| Running { engine, remotes }),
+            sounds: Sounds::new(sample_rate, logger),
             logs,
             entries: VecDeque::new(),
             started,
@@ -80,10 +91,28 @@ impl App {
         }
     }
 
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         while let Ok(entry) = self.logs.try_recv() {
             self.push_entry(entry);
         }
+
+        let dropped_files: Vec<_> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !dropped_files.is_empty() {
+            self.sounds.add_files(dropped_files);
+        }
+        self.sounds.poll(
+            self.running
+                .as_mut()
+                .ok()
+                .map(|running| &mut running.remotes.soundboard),
+        );
 
         let Ok(running) = &self.running else {
             return;
@@ -123,7 +152,7 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll();
+        self.poll(&ui.ctx().clone());
         ui.ctx().request_repaint_after(REPAINT_EVERY);
 
         egui::Panel::top("header")
@@ -144,8 +173,8 @@ impl eframe::App for App {
             .show(ui, |ui| self.side_panel(ui));
 
         egui::CentralPanel::default()
-            .frame(panel_frame(theme::BG, 20))
-            .show(ui, |ui| self.chain_panel(ui));
+            .frame(panel_frame(theme::BG, 16))
+            .show(ui, |ui| self.main_area(ui));
     }
 }
 
@@ -228,68 +257,41 @@ impl App {
             });
     }
 
-    fn chain_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Effect chain").strong().size(18.0));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new("Drag the handle to reorder · double-click a slider to reset")
-                        .color(theme::TEXT_DIM),
-                );
-            });
-        });
-        ui.add_space(4.0);
-
-        let Ok(running) = &mut self.running else {
-            if let Err(err) = &self.running {
+    /// Effects and sounds: side by side when there's room, stacked otherwise.
+    fn main_area(&mut self, ui: &mut egui::Ui) {
+        let running = match &mut self.running {
+            Ok(running) => running,
+            Err(err) => {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
                     ui.label(RichText::new("Audio could not start").strong().size(16.0));
-                    ui.label(RichText::new(err).color(theme::ERROR));
+                    ui.label(RichText::new(err.as_str()).color(theme::ERROR));
                 });
+                return;
             }
-            return;
         };
+        let destination = output_summary(&running.engine);
+        let pipeline = &mut running.remotes.pipeline;
+        let soundboard = &mut running.remotes.soundboard;
+        let sounds = &mut self.sounds;
 
-        let mut pending_move = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            flow_label(ui, "Microphone", true);
-            let count = running.remote.effects().len();
-            for index in 0..count {
-                let controls = running.remote.effects()[index].clone();
-                let card = effect_card(ui, index, &controls);
-
-                // While something is dragged over this card, show where it would land.
-                if let (Some(dragged), Some(pointer)) = (
-                    card.dnd_hover_payload::<DraggedEffect>(),
-                    ui.input(|input| input.pointer.interact_pos()),
-                ) {
-                    let above = pointer.y < card.rect.center().y;
-                    let y = if above {
-                        card.rect.top() - 4.0
-                    } else {
-                        card.rect.bottom() + 4.0
-                    };
-                    ui.painter()
-                        .hline(card.rect.x_range(), y, Stroke::new(3.0, theme::ACCENT));
-
-                    if card.dnd_release_payload::<DraggedEffect>().is_some() {
-                        let insert_at = if above { index } else { index + 1 };
-                        // Removing the dragged card first shifts everything after it up by one.
-                        let to = if insert_at > dragged.0 {
-                            insert_at - 1
-                        } else {
-                            insert_at
-                        };
-                        pending_move = Some((dragged.0, to));
-                    }
-                }
-            }
-            flow_label(ui, &output_summary(&running.engine), false);
-        });
-
-        if let Some((from, to)) = pending_move {
-            running.remote.move_effect(from, to);
+        if ui.available_width() >= TWO_COLUMNS_MIN_WIDTH {
+            ui.columns(2, |columns| {
+                egui::ScrollArea::vertical()
+                    .id_salt("effects")
+                    .show(&mut columns[0], |ui| {
+                        chain::show(ui, pipeline, &destination)
+                    });
+                egui::ScrollArea::vertical()
+                    .id_salt("sounds")
+                    .show(&mut columns[1], |ui| sounds.show(ui, Some(soundboard)));
+            });
+        } else {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                chain::show(ui, pipeline, &destination);
+                ui.add_space(20.0);
+                sounds.show(ui, Some(soundboard));
+            });
         }
     }
 
@@ -392,69 +394,6 @@ fn output_section(ui: &mut egui::Ui, engine: &Engine) {
     ui.label(RichText::new(hint).color(theme::TEXT_DIM));
 }
 
-fn effect_card(
-    ui: &mut egui::Ui,
-    index: usize,
-    controls: &crate::dsp::controls::EffectControls,
-) -> egui::Response {
-    let mut enabled = controls.is_enabled();
-    let border = if enabled {
-        theme::ACCENT.gamma_multiply(0.5)
-    } else {
-        theme::CARD_BORDER
-    };
-
-    egui::Frame::NONE
-        .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, border))
-        .corner_radius(CornerRadius::same(12))
-        .inner_margin(egui::Margin::same(14))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.dnd_drag_source(
-                    egui::Id::new(("effect", index)),
-                    DraggedEffect(index),
-                    |ui| {
-                        widgets::grip(ui);
-                    },
-                );
-                ui.label(
-                    RichText::new(format!("{}", index + 1))
-                        .monospace()
-                        .color(theme::TEXT_DIM),
-                );
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(controls.name).strong().size(15.0));
-                    ui.label(RichText::new(controls.description).color(theme::TEXT_DIM));
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if widgets::toggle(ui, &mut enabled).changed() {
-                        controls.set_enabled(enabled);
-                    }
-                });
-            });
-
-            if !controls.params.is_empty() {
-                ui.add_space(6.0);
-            }
-            for param in &controls.params {
-                let mut value = param.get();
-                let slider = egui::Slider::new(&mut value, param.min..=param.max)
-                    .text(param.name)
-                    .suffix(param.unit)
-                    .fixed_decimals(1);
-                let response = ui.add_enabled(enabled, slider);
-                if response.double_clicked() {
-                    param.set(param.default);
-                } else if response.changed() {
-                    param.set(value);
-                }
-            }
-        })
-        .response
-}
-
 fn panel_frame(fill: egui::Color32, margin: i8) -> egui::Frame {
     egui::Frame::NONE
         .fill(fill)
@@ -474,17 +413,4 @@ fn stat_row(ui: &mut egui::Ui, label: &str, value: String) {
     ui.label(RichText::new(label).color(theme::TEXT_DIM));
     ui.label(RichText::new(value).monospace());
     ui.end_row();
-}
-
-/// The source/destination at the ends of the chain, with an arrow pointing into it.
-fn flow_label(ui: &mut egui::Ui, text: &str, is_source: bool) {
-    ui.vertical_centered(|ui| {
-        if !is_source {
-            widgets::arrow_down(ui);
-        }
-        ui.label(RichText::new(text).color(theme::TEXT_DIM));
-        if is_source {
-            widgets::arrow_down(ui);
-        }
-    });
 }

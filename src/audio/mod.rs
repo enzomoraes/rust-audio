@@ -13,6 +13,7 @@ use ringbuf::traits::{Observer, Split};
 use ringbuf::{HeapRb, Obs};
 
 use crate::dsp::{Frame, PipelineBuilder, PipelineRemote};
+use crate::soundboard::{self, SoundboardRemote};
 use crate::telemetry::{Logger, Stats};
 use streams::Destination;
 
@@ -28,6 +29,12 @@ pub struct EngineInfo {
     pub virtual_mic: Option<String>,
     pub sample_rate: u32,
     pub block_frames: usize,
+}
+
+/// The UI's handles for changing what the audio thread does.
+pub struct Remotes {
+    pub pipeline: PipelineRemote,
+    pub soundboard: SoundboardRemote,
 }
 
 pub struct QueueStatus {
@@ -57,10 +64,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn start(
-        chain: PipelineBuilder,
-        logger: Logger,
-    ) -> Result<(Engine, PipelineRemote), String> {
+    pub fn start(chain: PipelineBuilder, logger: Logger) -> Result<(Engine, Remotes), String> {
         let mic = devices::default_mic()?;
         let mic_config = devices::input_config(&mic)?;
         let sample_rate = mic_config.stream.sample_rate;
@@ -86,7 +90,11 @@ impl Engine {
         };
         let stats = Arc::new(Stats::default());
         let monitoring = Arc::new(AtomicBool::new(false));
-        let (pipeline, remote) = chain.build(block_frames, sample_rate);
+        let (pipeline, pipeline_remote, warnings) = chain.build(block_frames, sample_rate);
+        for warning in warnings {
+            logger.warn(warning);
+        }
+        let (mixer, soundboard_remote) = soundboard::channel();
         let mut destinations = Vec::new();
         let mut queues = Vec::new();
 
@@ -186,6 +194,7 @@ impl Engine {
             mic_config.stream,
             destinations,
             pipeline,
+            mixer,
             stats.clone(),
             logger.clone(),
         )?;
@@ -225,7 +234,11 @@ impl Engine {
             _speaker: speaker_stream,
             _virtual_mic: virtual_mic_stream,
         };
-        Ok((engine, remote))
+        let remotes = Remotes {
+            pipeline: pipeline_remote,
+            soundboard: soundboard_remote,
+        };
+        Ok((engine, remotes))
     }
 
     pub fn info(&self) -> &EngineInfo {

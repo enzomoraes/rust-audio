@@ -1,6 +1,8 @@
 use std::f32::consts::TAU;
 use std::sync::Arc;
 
+use nnnoiseless::DenoiseState;
+
 use super::controls::{EffectControls, Param};
 use super::{Effect, Frame};
 
@@ -130,8 +132,9 @@ impl Effect for RingModulation {
         &self.controls
     }
 
-    fn prepare(&mut self, sample_rate: u32) {
+    fn prepare(&mut self, sample_rate: u32) -> Result<(), String> {
         self.sample_rate = sample_rate as f32;
+        Ok(())
     }
 
     fn process(&mut self, block: &mut [Frame]) {
@@ -148,6 +151,103 @@ impl Effect for RingModulation {
             self.phase += step;
             if self.phase >= TAU {
                 self.phase -= TAU;
+            }
+        }
+    }
+}
+
+// RNNoise works on fixed 10 ms frames of 48 kHz audio.
+const RNNOISE_FRAME: usize = DenoiseState::FRAME_SIZE;
+const RNNOISE_RATE: u32 = 48_000;
+// RNNoise expects samples in the 16-bit range (±32768) instead of ±1.0.
+const I16_SCALE: f32 = 32768.0;
+
+/// Removes background noise (hiss, fans, keyboards, traffic) while keeping the voice,
+/// using RNNoise: a small neural network trained to tell speech from noise.
+///
+/// RNNoise only accepts whole 480-sample frames, but our blocks can be any size. So the
+/// effect always works one frame behind: each incoming sample goes into the frame being
+/// filled, and the sample going out comes from the previous, already-cleaned frame.
+/// That costs exactly one frame (10 ms) of delay, for any block size.
+pub struct NoiseSuppression {
+    controls: Arc<EffectControls>,
+    // One network per channel: each keeps its own memory of what it has heard.
+    states: [Box<DenoiseState<'static>>; 2],
+    /// The frame being filled with new input.
+    input: [[f32; RNNOISE_FRAME]; 2],
+    /// The previous frame, before and after cleaning, being played back.
+    dry: [[f32; RNNOISE_FRAME]; 2],
+    wet: [[f32; RNNOISE_FRAME]; 2],
+    position: usize,
+    supported: bool,
+}
+
+impl NoiseSuppression {
+    pub fn new() -> Self {
+        Self {
+            controls: Arc::new(EffectControls::new(
+                "Noise removal",
+                "Removes background noise from your voice (RNNoise). Adds 10 ms of delay.",
+                vec![Param::new("Strength", "%", 0.0, 100.0, 100.0)],
+            )),
+            states: [DenoiseState::new(), DenoiseState::new()],
+            input: [[0.0; RNNOISE_FRAME]; 2],
+            dry: [[0.0; RNNOISE_FRAME]; 2],
+            wet: [[0.0; RNNOISE_FRAME]; 2],
+            position: 0,
+            supported: true,
+        }
+    }
+}
+
+impl Effect for NoiseSuppression {
+    fn controls(&self) -> &Arc<EffectControls> {
+        &self.controls
+    }
+
+    fn prepare(&mut self, sample_rate: u32) -> Result<(), String> {
+        self.supported = sample_rate == RNNOISE_RATE;
+        if self.supported {
+            Ok(())
+        } else {
+            Err(format!(
+                "Noise removal needs a 48000 Hz mic, but yours runs at {sample_rate} Hz; it will be skipped"
+            ))
+        }
+    }
+
+    fn reset(&mut self) {
+        self.input = [[0.0; RNNOISE_FRAME]; 2];
+        self.dry = [[0.0; RNNOISE_FRAME]; 2];
+        self.wet = [[0.0; RNNOISE_FRAME]; 2];
+        self.position = 0;
+    }
+
+    fn process(&mut self, block: &mut [Frame]) {
+        if !self.supported {
+            return;
+        }
+        // Blends the original back in; both halves are from the same (previous) frame.
+        let strength = self.controls.params[0].get() / 100.0;
+
+        for frame in block.iter_mut() {
+            for (channel, sample) in frame.iter_mut().enumerate() {
+                let dry = self.dry[channel][self.position];
+                let wet = self.wet[channel][self.position];
+                self.input[channel][self.position] = *sample * I16_SCALE;
+                *sample = (dry + (wet - dry) * strength) / I16_SCALE;
+            }
+
+            self.position += 1;
+            if self.position == RNNOISE_FRAME {
+                self.position = 0;
+                for channel in 0..2 {
+                    // The FFT inside allocates its plans the first time it runs on this
+                    // thread, then reuses them: a one-off, not a per-frame allocation.
+                    self.states[channel]
+                        .process_frame(&mut self.wet[channel], &self.input[channel]);
+                    self.dry[channel] = self.input[channel];
+                }
             }
         }
     }

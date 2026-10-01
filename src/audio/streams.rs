@@ -6,6 +6,7 @@ use ringbuf::traits::{Consumer, Producer};
 use ringbuf::{HeapCons, HeapProd};
 
 use crate::dsp::{Frame, Pipeline};
+use crate::soundboard::Mixer;
 use crate::telemetry::{Logger, Stats};
 
 /// One place the processed audio goes. `active: None` means always on.
@@ -19,6 +20,7 @@ pub fn build_input_stream(
     config: cpal::StreamConfig,
     mut destinations: Vec<Destination>,
     mut pipeline: Pipeline,
+    mut mixer: Mixer,
     stats: Arc<Stats>,
     logger: Logger,
 ) -> Result<cpal::Stream, String> {
@@ -36,7 +38,9 @@ pub fn build_input_stream(
                     [l, r, ..] => [*l, *r],
                     [] => unreachable!(),
                 });
-                pipeline.process(frames, |out: &[Frame]| {
+                pipeline.process(frames, |out: &mut [Frame]| {
+                    // After the effects, so the sounds come out clean.
+                    mixer.mix(out);
                     stats
                         .output_peak
                         .store_max(peak(out.iter().flatten().copied()));

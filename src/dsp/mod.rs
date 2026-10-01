@@ -14,9 +14,21 @@ pub trait Effect: Send {
     fn controls(&self) -> &Arc<EffectControls>;
 
     /// Called once before audio starts, when the device's sample rate is known.
-    fn prepare(&mut self, _sample_rate: u32) {}
+    /// An `Err` is a warning for the user; the effect still runs (or passes audio through).
+    fn prepare(&mut self, _sample_rate: u32) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Called when the effect is switched back on, so it can drop audio it kept from before.
+    fn reset(&mut self) {}
 
     fn process(&mut self, block: &mut [Frame]);
+}
+
+/// An effect plus whether it ran in the previous block, to notice it being switched on.
+struct Slot {
+    effect: Box<dyn Effect>,
+    was_enabled: bool,
 }
 
 /// Changes to the chain's structure, sent from the UI to the audio thread.
@@ -45,11 +57,17 @@ impl PipelineBuilder {
     }
 
     /// Splits the chain into the part that runs on the audio thread and the
-    /// handle the UI uses to control it.
-    pub fn build(mut self, block_size: usize, sample_rate: u32) -> (Pipeline, PipelineRemote) {
-        for effect in &mut self.effects {
-            effect.prepare(sample_rate);
-        }
+    /// handle the UI uses to control it, plus any warnings from the effects.
+    pub fn build(
+        mut self,
+        block_size: usize,
+        sample_rate: u32,
+    ) -> (Pipeline, PipelineRemote, Vec<String>) {
+        let warnings = self
+            .effects
+            .iter_mut()
+            .filter_map(|effect| effect.prepare(sample_rate).err())
+            .collect();
         let controls = self
             .effects
             .iter()
@@ -58,7 +76,14 @@ impl PipelineBuilder {
         let (commands_tx, commands_rx) = HeapRb::new(COMMAND_QUEUE).split();
 
         let pipeline = Pipeline {
-            effects: self.effects,
+            effects: self
+                .effects
+                .into_iter()
+                .map(|effect| Slot {
+                    was_enabled: effect.controls().is_enabled(),
+                    effect,
+                })
+                .collect(),
             data: vec![[0.0, 0.0]; block_size],
             commands: commands_rx,
         };
@@ -66,12 +91,12 @@ impl PipelineBuilder {
             effects: controls,
             commands: commands_tx,
         };
-        (pipeline, remote)
+        (pipeline, remote, warnings)
     }
 }
 
 pub struct Pipeline {
-    effects: Vec<Box<dyn Effect>>,
+    effects: Vec<Slot>,
     data: Vec<Frame>,
     commands: HeapCons<Command>,
 }
@@ -80,7 +105,7 @@ impl Pipeline {
     pub fn process(
         &mut self,
         mut input: impl Iterator<Item = Frame>,
-        mut output: impl FnMut(&[Frame]),
+        mut output: impl FnMut(&mut [Frame]),
     ) {
         self.apply_commands();
 
@@ -93,9 +118,14 @@ impl Pipeline {
                 .count();
 
             let block: &mut [Frame] = &mut self.data[..n];
-            for effect in self.effects.iter_mut() {
-                if effect.controls().is_enabled() {
-                    effect.process(block);
+            for slot in self.effects.iter_mut() {
+                let enabled = slot.effect.controls().is_enabled();
+                if enabled && !slot.was_enabled {
+                    slot.effect.reset();
+                }
+                slot.was_enabled = enabled;
+                if enabled {
+                    slot.effect.process(block);
                 }
             }
             output(block);
