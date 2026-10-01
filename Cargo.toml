@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 cpal = "0.18.2"
 eframe = "0.35.0"
-nnnoiseless = { version = "0.5.2", default-features = false }
 rfd = "0.17.2"
 ringbuf = "0.5.2"
 symphonia = { version = "0.6.1", default-features = false, features = ["mp3", "wav", "pcm"] }
@@ -20,8 +19,3 @@ codegen-units = 1      # single codegen unit enables maximum inlining
 
 [target.'cfg(target_os = "linux")'.dependencies]
 pipewire = { version = "0.10.1", features = ["v0_3_49"] }
-
-# Dependencies like RNNoise and the MP3 decoder are too slow unoptimized for real-time
-# audio, so they're optimized even in `cargo run`. Our own code stays quick to compile.
-[profile.dev.package."*"]
-opt-level = 3

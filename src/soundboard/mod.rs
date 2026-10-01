@@ -67,8 +67,17 @@ impl Mixer {
         while let Some(command) = self.commands.try_pop() {
             match command {
                 Command::Play(sound) => {
-                    // `voices` was allocated with room for MAX_VOICES, so this push never allocates.
-                    if self.voices.len() < MAX_VOICES {
+                    let already_playing = self
+                        .voices
+                        .iter_mut()
+                        .find(|voice| Arc::ptr_eq(&voice.sound, &sound));
+                    if let Some(voice) = already_playing {
+                        // Clicking a playing sound restarts it instead of layering a second copy.
+                        // The extra Arc goes back like a finished one, so the UI's count stays right.
+                        voice.position = 0;
+                        self.give_back(sound);
+                    } else if self.voices.len() < MAX_VOICES {
+                        // `voices` was allocated with room for MAX_VOICES, so this push never allocates.
                         self.voices.push(Voice { sound, position: 0 });
                     } else {
                         self.give_back(sound);

@@ -8,15 +8,15 @@ use std::time::Instant;
 
 use audio::Engine;
 use dsp::PipelineBuilder;
-use dsp::effects::{Gain, NoiseSuppression, RingModulation, SoftClipping};
+use dsp::effects::{Gain, NoiseGate, RingModulation, SoftClipping};
 
 fn main() -> eframe::Result {
     let started = Instant::now();
     let (logger, logs) = telemetry::log_channel();
 
-    // Noise removal first, so the robot effects work on the cleaned voice.
+    // The gate first: it has to judge the raw mic level, before gain changes it.
     let chain = PipelineBuilder::new()
-        .add(NoiseSuppression::new())
+        .add(NoiseGate::new(-40.0))
         .add(RingModulation::new(200.0))
         .add(Gain::new(10.0))
         .add(SoftClipping::new());

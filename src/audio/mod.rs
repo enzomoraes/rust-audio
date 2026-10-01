@@ -90,10 +90,7 @@ impl Engine {
         };
         let stats = Arc::new(Stats::default());
         let monitoring = Arc::new(AtomicBool::new(false));
-        let (pipeline, pipeline_remote, warnings) = chain.build(block_frames, sample_rate);
-        for warning in warnings {
-            logger.warn(warning);
-        }
+        let (pipeline, pipeline_remote) = chain.build(block_frames, sample_rate);
         let (mixer, soundboard_remote) = soundboard::channel();
         let mut destinations = Vec::new();
         let mut queues = Vec::new();

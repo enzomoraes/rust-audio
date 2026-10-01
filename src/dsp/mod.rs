@@ -14,10 +14,7 @@ pub trait Effect: Send {
     fn controls(&self) -> &Arc<EffectControls>;
 
     /// Called once before audio starts, when the device's sample rate is known.
-    /// An `Err` is a warning for the user; the effect still runs (or passes audio through).
-    fn prepare(&mut self, _sample_rate: u32) -> Result<(), String> {
-        Ok(())
-    }
+    fn prepare(&mut self, _sample_rate: u32) {}
 
     /// Called when the effect is switched back on, so it can drop audio it kept from before.
     fn reset(&mut self) {}
@@ -57,17 +54,11 @@ impl PipelineBuilder {
     }
 
     /// Splits the chain into the part that runs on the audio thread and the
-    /// handle the UI uses to control it, plus any warnings from the effects.
-    pub fn build(
-        mut self,
-        block_size: usize,
-        sample_rate: u32,
-    ) -> (Pipeline, PipelineRemote, Vec<String>) {
-        let warnings = self
-            .effects
-            .iter_mut()
-            .filter_map(|effect| effect.prepare(sample_rate).err())
-            .collect();
+    /// handle the UI uses to control it.
+    pub fn build(mut self, block_size: usize, sample_rate: u32) -> (Pipeline, PipelineRemote) {
+        for effect in &mut self.effects {
+            effect.prepare(sample_rate);
+        }
         let controls = self
             .effects
             .iter()
@@ -91,7 +82,7 @@ impl PipelineBuilder {
             effects: controls,
             commands: commands_tx,
         };
-        (pipeline, remote, warnings)
+        (pipeline, remote)
     }
 }
 

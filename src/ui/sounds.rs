@@ -171,8 +171,10 @@ impl Sounds {
             });
         });
         ui.label(
-            RichText::new("Played clean, without the effects. Right-click a sound to remove it.")
-                .color(theme::TEXT_DIM),
+            RichText::new(
+                "Played clean, without the effects. Click again to restart, right-click to remove.",
+            )
+            .color(theme::TEXT_DIM),
         );
 
         if let Some(remote) = remote.as_deref() {

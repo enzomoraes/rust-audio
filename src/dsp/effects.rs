@@ -1,8 +1,6 @@
 use std::f32::consts::TAU;
 use std::sync::Arc;
 
-use nnnoiseless::DenoiseState;
-
 use super::controls::{EffectControls, Param};
 use super::{Effect, Frame};
 
@@ -132,9 +130,8 @@ impl Effect for RingModulation {
         &self.controls
     }
 
-    fn prepare(&mut self, sample_rate: u32) -> Result<(), String> {
+    fn prepare(&mut self, sample_rate: u32) {
         self.sample_rate = sample_rate as f32;
-        Ok(())
     }
 
     fn process(&mut self, block: &mut [Frame]) {
@@ -156,99 +153,112 @@ impl Effect for RingModulation {
     }
 }
 
-// RNNoise works on fixed 10 ms frames of 48 kHz audio.
-const RNNOISE_FRAME: usize = DenoiseState::FRAME_SIZE;
-const RNNOISE_RATE: u32 = 48_000;
-// RNNoise expects samples in the 16-bit range (±32768) instead of ±1.0.
-const I16_SCALE: f32 = 32768.0;
+// Closing a few dB below the opening threshold keeps the gate from chattering
+// open/closed when the level hovers right at the threshold.
+const GATE_HYSTERESIS_DB: f32 = 6.0;
+// Stays open this long after the voice drops, so short pauses between syllables
+// don't cut words apart.
+const GATE_HOLD_SECONDS: f32 = 0.05;
+// Opening fast keeps the start of words; a few ms instead of instant avoids a click.
+const GATE_ATTACK_SECONDS: f32 = 0.002;
+// How fast the level detector forgets a peak.
+const DETECTOR_DECAY_SECONDS: f32 = 0.02;
 
-/// Removes background noise (hiss, fans, keyboards, traffic) while keeping the voice,
-/// using RNNoise: a small neural network trained to tell speech from noise.
+/// Silences the mic while you're not talking, so background noise doesn't get
+/// through between words. While you talk the gate is open and the noise passes
+/// with the voice: it only cleans up the pauses.
 ///
-/// RNNoise only accepts whole 480-sample frames, but our blocks can be any size. So the
-/// effect always works one frame behind: each incoming sample goes into the frame being
-/// filled, and the sample going out comes from the previous, already-cleaned frame.
-/// That costs exactly one frame (10 ms) of delay, for any block size.
-pub struct NoiseSuppression {
+///   level above Threshold  -> open (the voice passes)
+///   level below Threshold - 6 dB for longer than the hold -> fades closed over Release
+pub struct NoiseGate {
     controls: Arc<EffectControls>,
-    // One network per channel: each keeps its own memory of what it has heard.
-    states: [Box<DenoiseState<'static>>; 2],
-    /// The frame being filled with new input.
-    input: [[f32; RNNOISE_FRAME]; 2],
-    /// The previous frame, before and after cleaning, being played back.
-    dry: [[f32; RNNOISE_FRAME]; 2],
-    wet: [[f32; RNNOISE_FRAME]; 2],
-    position: usize,
-    supported: bool,
+    sample_rate: f32,
+    /// Smoothed peak level of the input, linear.
+    envelope: f32,
+    /// Current gain applied to the signal: 0 = closed, 1 = open.
+    gain: f32,
+    open: bool,
+    hold_remaining: usize,
 }
 
-impl NoiseSuppression {
-    pub fn new() -> Self {
+impl NoiseGate {
+    pub fn new(threshold_db: f32) -> Self {
         Self {
             controls: Arc::new(EffectControls::new(
-                "Noise removal",
-                "Removes background noise from your voice (RNNoise). Adds 10 ms of delay.",
-                vec![Param::new("Strength", "%", 0.0, 100.0, 100.0)],
+                "Noise gate",
+                "Mutes the mic while you're not talking, so noise doesn't leak between words.",
+                vec![
+                    Param::new("Threshold", " dB", -80.0, 0.0, threshold_db),
+                    Param::new("Release", " ms", 10.0, 1000.0, 150.0),
+                ],
             )),
-            states: [DenoiseState::new(), DenoiseState::new()],
-            input: [[0.0; RNNOISE_FRAME]; 2],
-            dry: [[0.0; RNNOISE_FRAME]; 2],
-            wet: [[0.0; RNNOISE_FRAME]; 2],
-            position: 0,
-            supported: true,
+            sample_rate: 48_000.0,
+            envelope: 0.0,
+            gain: 0.0,
+            open: false,
+            hold_remaining: 0,
         }
+    }
+
+    /// How much of the remaining distance a one-pole smoother covers per sample,
+    /// to get about 63% of the way there in `seconds`.
+    fn coefficient(&self, seconds: f32) -> f32 {
+        1.0 - (-1.0 / (seconds * self.sample_rate)).exp()
     }
 }
 
-impl Effect for NoiseSuppression {
+impl Effect for NoiseGate {
     fn controls(&self) -> &Arc<EffectControls> {
         &self.controls
     }
 
-    fn prepare(&mut self, sample_rate: u32) -> Result<(), String> {
-        self.supported = sample_rate == RNNOISE_RATE;
-        if self.supported {
-            Ok(())
-        } else {
-            Err(format!(
-                "Noise removal needs a 48000 Hz mic, but yours runs at {sample_rate} Hz; it will be skipped"
-            ))
-        }
+    fn prepare(&mut self, sample_rate: u32) {
+        self.sample_rate = sample_rate as f32;
     }
 
     fn reset(&mut self) {
-        self.input = [[0.0; RNNOISE_FRAME]; 2];
-        self.dry = [[0.0; RNNOISE_FRAME]; 2];
-        self.wet = [[0.0; RNNOISE_FRAME]; 2];
-        self.position = 0;
+        self.envelope = 0.0;
+        self.gain = 0.0;
+        self.open = false;
+        self.hold_remaining = 0;
     }
 
     fn process(&mut self, block: &mut [Frame]) {
-        if !self.supported {
-            return;
-        }
-        // Blends the original back in; both halves are from the same (previous) frame.
-        let strength = self.controls.params[0].get() / 100.0;
+        let threshold_db = self.controls.params[0].get();
+        let open_level = 10f32.powf(threshold_db / 20.0);
+        let close_level = 10f32.powf((threshold_db - GATE_HYSTERESIS_DB) / 20.0);
+        let release_seconds = self.controls.params[1].get() / 1000.0;
+
+        let attack = self.coefficient(GATE_ATTACK_SECONDS);
+        let release = self.coefficient(release_seconds);
+        let detector_decay = 1.0 - self.coefficient(DETECTOR_DECAY_SECONDS);
+        let hold_samples = (GATE_HOLD_SECONDS * self.sample_rate) as usize;
 
         for frame in block.iter_mut() {
-            for (channel, sample) in frame.iter_mut().enumerate() {
-                let dry = self.dry[channel][self.position];
-                let wet = self.wet[channel][self.position];
-                self.input[channel][self.position] = *sample * I16_SCALE;
-                *sample = (dry + (wet - dry) * strength) / I16_SCALE;
-            }
+            // Both channels share one gain, so the stereo image doesn't shift.
+            let peak = frame[0].abs().max(frame[1].abs());
+            self.envelope = peak.max(self.envelope * detector_decay);
 
-            self.position += 1;
-            if self.position == RNNOISE_FRAME {
-                self.position = 0;
-                for channel in 0..2 {
-                    // The FFT inside allocates its plans the first time it runs on this
-                    // thread, then reuses them: a one-off, not a per-frame allocation.
-                    self.states[channel]
-                        .process_frame(&mut self.wet[channel], &self.input[channel]);
-                    self.dry[channel] = self.input[channel];
+            if self.envelope >= open_level {
+                self.open = true;
+                self.hold_remaining = hold_samples;
+            } else if self.envelope < close_level {
+                if self.hold_remaining > 0 {
+                    self.hold_remaining -= 1;
+                } else {
+                    self.open = false;
                 }
             }
+
+            let (target, speed) = if self.open {
+                (1.0, attack)
+            } else {
+                (0.0, release)
+            };
+            self.gain += (target - self.gain) * speed;
+
+            frame[0] *= self.gain;
+            frame[1] *= self.gain;
         }
     }
 }
