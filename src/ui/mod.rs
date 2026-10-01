@@ -331,11 +331,11 @@ impl App {
 /// Where the processed voice is going right now, e.g. "Rust Phone mic + speakers".
 fn output_summary(engine: &Engine) -> String {
     let mut outputs = Vec::new();
-    if engine.info().has_virtual_mic {
-        outputs.push("Rust Phone mic");
+    if let Some(mic) = &engine.info().virtual_mic {
+        outputs.push(format!("{mic} mic"));
     }
     if engine.is_monitoring() {
-        outputs.push("speakers");
+        outputs.push("speakers".to_string());
     }
     if outputs.is_empty() {
         "nowhere (listening is off)".to_string()
@@ -349,23 +349,24 @@ fn output_section(ui: &mut egui::Ui, engine: &Engine) {
     let info = engine.info();
 
     ui.horizontal(|ui| {
-        ui.label("Rust Phone mic");
+        ui.label("Virtual mic");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if info.has_virtual_mic {
+            if info.virtual_mic.is_some() {
                 widgets::chip(ui, "Active", theme::OK, true);
             } else {
-                widgets::chip(ui, "Linux only", theme::TEXT_DIM, false);
+                widgets::chip(ui, "Not installed", theme::WARN, false);
             }
         });
     });
-    if info.has_virtual_mic {
-        ui.label(
-            RichText::new(
-                "Pick \"Rust Phone\" as the microphone in Meet, Discord or any other app.",
-            )
-            .color(theme::TEXT_DIM),
-        );
-    }
+    let hint = match &info.virtual_mic {
+        Some(mic) => format!("Pick \"{mic}\" as the microphone in Meet, Discord or any other app."),
+        None if cfg!(target_os = "windows") => {
+            "No virtual mic driver found. Install VB-CABLE to test until the Rust Phone driver is ready."
+                .to_string()
+        }
+        None => "Virtual mics aren't supported on this system yet.".to_string(),
+    };
+    ui.label(RichText::new(hint).color(theme::TEXT_DIM));
     ui.add_space(8.0);
 
     ui.horizontal(|ui| {
